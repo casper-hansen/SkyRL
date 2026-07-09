@@ -11,7 +11,7 @@ from typing import Callable
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from ray.util.placement_group import placement_group
 from transformers import AutoTokenizer
 
@@ -79,10 +79,23 @@ def _build_rollout_expert_indices(full_sequences, all_routed_experts, max_seq_le
 class SkyRLTrainBackendOverrides(BaseModel, extra="allow"):
     """Configuration overrides for the SkyRL-Train backend.
 
-    All keys are applied as overrides to the default SkyRL-Train config.
+    Extra keys are applied as overrides to the default SkyRL-Train config.
+    Fields declared here are consumed by the backend directly and are NOT
+    forwarded as SkyRL-Train config overrides.
     """
 
-    pass
+    routed_experts_cache_cap: int = Field(
+        default=8192,
+        gt=0,
+        description=(
+            "Rollout Routing Replay (R3): max number of samples whose rollout routing is cached "
+            "on the backend (host RAM) between sampling and forward_backward. Size it to at least "
+            "the number of samples generated per training step so routing isn't evicted before it "
+            "is replayed. Memory per entry is roughly seq_len * num_layers * top_k bytes "
+            "(uint8 when num_experts<=256, else int16), so long sequences or large caps cost "
+            "several GB. Ignored unless moe_enable_routing_replay is set."
+        ),
+    )
 
 
 class FSDPBackendOverrides(SkyRLTrainBackendOverrides):
@@ -181,9 +194,10 @@ class SkyRLTrainBackend(AbstractBackend):
         # sample time, keyed by the full sampled token sequence (prompt +
         # response). forward_backward looks routing up by the training sequence
         # and replays it, so R3 stays a server-side launch flag and never
-        # touches the client-facing Tinker types. Bounded FIFO to cap memory.
+        # touches the client-facing Tinker types. Bounded FIFO to cap memory;
+        # the cap is configurable via backend_config.routed_experts_cache_cap.
         self._routed_experts_cache: "OrderedDict[tuple[int, ...], np.ndarray]" = OrderedDict()
-        self._routed_experts_cache_cap = 8192
+        self._routed_experts_cache_cap = getattr(config, "routed_experts_cache_cap", 8192)
         self._routed_experts_missing_warned = False
 
         # New inference infrastructure
