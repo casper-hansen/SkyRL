@@ -69,6 +69,33 @@ class _NullInferenceClient:
         return None
 
 
+@pytest.mark.megatron
+def test_kimi_k25_vllm_lora_patch():
+    """The patched wrapper must satisfy vLLM's *instance-level* SupportsLoRA
+    protocol check (which requires every protocol member, not just the three
+    documented attributes)."""
+    pytest.importorskip("vllm")
+    from typing_extensions import get_protocol_members
+
+    from vllm.model_executor.models.interfaces import SupportsLoRA, supports_lora
+    from vllm.model_executor.models.kimi_k25 import KimiK25ForConditionalGeneration
+
+    from skyrl.backends.skyrl_train.patches.vllm_kimi_k25_lora import (
+        apply_kimi_k25_lora_patch,
+    )
+
+    apply_kimi_k25_lora_patch()
+
+    missing = [m for m in get_protocol_members(SupportsLoRA) if not hasattr(KimiK25ForConditionalGeneration, m)]
+    assert not missing, f"missing SupportsLoRA protocol members: {missing}"
+    assert supports_lora(KimiK25ForConditionalGeneration)
+    # The worker-side gate checks the *instance*; bypass __init__ to test it.
+    instance = object.__new__(KimiK25ForConditionalGeneration)
+    assert isinstance(instance, SupportsLoRA), "instance-level protocol check failed"
+    assert supports_lora(instance)
+    assert not KimiK25ForConditionalGeneration.is_3d_moe_weight  # per-expert LoRA keys
+
+
 @_needs_kimi
 @pytest.mark.megatron
 def test_kimi_bridge_dispatch_and_provider():
@@ -126,6 +153,9 @@ def _kimi_worker_cfg(lora_sync_path: str) -> SkyRLTrainConfig:
     cfg.trainer.policy.language_model_only = True
     cfg.trainer.ref.language_model_only = True
     cfg.generator.inference_engine.language_model_only = True
+    # MLA + sample packing needs TE's cuDNN fused attention (flash_attn=True
+    # would export NVTE_FUSED_ATTN=0; see test_megatron_models MLA handling).
+    cfg.trainer.flash_attn = False
 
     lora = cfg.trainer.policy.model.lora
     lora.rank = 8

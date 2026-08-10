@@ -36,6 +36,10 @@ def apply_kimi_k25_lora_patch() -> None:
     if getattr(cls, "supports_lora", False):
         return  # native support (or already patched)
 
+    # The full ``SupportsLoRA`` member set: the worker-side gate is a
+    # runtime-checkable Protocol isinstance() on the model *instance*, which
+    # requires every protocol member to exist (not just the three documented
+    # attributes). Values mirror the inner DeepSeek decoder's declarations.
     cls.supports_lora = True
     # Share the inner decoder's mapping *object*: DeepseekV2ForCausalLM.__init__
     # adds "fused_qkv_a_proj" to its class-level dict at model build time (for
@@ -43,6 +47,11 @@ def apply_kimi_k25_lora_patch() -> None:
     # off the outer model -- sharing keeps the two views consistent.
     cls.packed_modules_mapping = DeepseekV2ForCausalLM.packed_modules_mapping
     cls.embedding_modules = {}
+    cls.lora_skip_prefixes = []
+    # DeepSeek decoders export per-expert LoRA keys (experts.<idx>.<proj>), not
+    # the flat 3D-MoE layout, and use gated MLPs.
+    cls.is_3d_moe_weight = False
+    cls.is_non_gated_moe = False
 
     def get_mm_mapping(self) -> MultiModelKeys:
         """Multimodal module split so LoRA skips the tower/connector."""

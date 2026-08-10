@@ -148,6 +148,7 @@ uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.policy.model.fake_int4_qat.bf16_base_path="$FAKE_QUANT_BF16_PATH" \
   trainer.policy.megatron_config.lora_config.merge_lora=false \
   trainer.fused_lm_head_logprob=true \
+  trainer.flash_attn=false \
   trainer.policy.language_model_only=$LANGUAGE_MODEL_ONLY \
   generator.inference_engine.language_model_only=$LANGUAGE_MODEL_ONLY \
   trainer.placement.colocate_all=true \
