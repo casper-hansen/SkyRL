@@ -405,6 +405,16 @@ class MegatronWorker:
         else:
             self.is_vlm = False
 
+        if self.is_vlm and getattr(hf_config_original, "model_type", None) == "kimi_k25":
+            # The KimiK25TextBridge (model_bridges.py) only builds the language model,
+            # so a full-VLM training request cannot be honored on this backend.
+            raise ValueError(
+                "Kimi K2.5-family checkpoints are supported text-only on the Megatron backend: "
+                "set trainer.policy.language_model_only=true and "
+                "generator.inference_engine.language_model_only=true "
+                "(the vision tower stays frozen in the inference engine)."
+            )
+
         override_config_kwargs = {
             "bos_token_id": tokenizer.bos_token_id,
             "eos_token_id": tokenizer.eos_token_id,
@@ -438,6 +448,13 @@ class MegatronWorker:
             logger.info(
                 "language_model_only=True: forcing Qwen3.5 text->GPTModel bridge "
                 "(native GDN thd packing path; vision tower dropped)"
+            )
+        if language_model_only and getattr(hf_config_original, "model_type", None) == "kimi_k25":
+            # Dispatch is automatic (KimiK25TextBridge registers the real architecture
+            # name); this log only makes the text-only load explicit.
+            logger.info(
+                "language_model_only=True: Kimi K2.5-family checkpoint -> text-only "
+                "DeepSeek-V3 bridge (vision tower + mm projector dropped)"
             )
 
         provider = bridge.to_megatron_provider()
@@ -1370,14 +1387,37 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             training_dtype=torch.bfloat16 if self.cfg.bf16 else torch.float32,
         )
 
+    def _is_lora_sync_writer_rank(self) -> bool:
+        """True on the first rank of each node (by hostname).
+
+        With ``merge_lora=False`` every vLLM worker reads ``lora_sync_path``
+        from its *local* filesystem when hot-loading the adapter, and in
+        multi-node colocated runs inference engines live on every node -- so
+        writing on global rank 0 alone only works with a shared filesystem.
+        Writing once per node (identical content, atomic renames) makes the
+        disk sync work on plain node-local paths and stays correct on shared
+        ones.
+        """
+        cached = getattr(self, "_lora_sync_writer_cache", None)
+        if cached is None:
+            import socket
+
+            hostnames = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(hostnames, socket.gethostname())
+            cached = hostnames.index(hostnames[torch.distributed.get_rank()]) == torch.distributed.get_rank()
+            self._lora_sync_writer_cache = cached
+        return cached
+
     async def _save_lora_adapters_and_sync(
         self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
     ):
         """Export LoRA adapter weights via Megatron-Bridge and tell the inference engine to load them.
 
         All ranks participate in the collective export (TP/PP/EP gathering is
-        handled internally by the bridge).  Only rank 0 writes to disk and
-        sends the ``LoraLoadRequest``.
+        handled internally by the bridge). The first rank on each node writes
+        the PEFT files (vLLM workers read them from their local filesystem;
+        see ``_is_lora_sync_writer_rank``), then rank 0 sends the
+        ``LoraLoadRequest`` once every node's files are in place.
         """
         import json
 
@@ -1391,7 +1431,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
             adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
 
-        if torch.distributed.get_rank() == 0:
+        rank = torch.distributed.get_rank()
+        if self._is_lora_sync_writer_rank():
             os.makedirs(lora_sync_path, exist_ok=True)
 
             # Rewrite fused-MoE expert LoRA into vLLM's flat PEFT layout so
@@ -1414,10 +1455,20 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
                 base_model_name_or_path=base_model_name_or_path,
             )
 
-            save_file(adapter_state, os.path.join(lora_sync_path, "adapter_model.safetensors"))
-            with open(os.path.join(lora_sync_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+            # Atomic renames so concurrent writers (shared filesystem) and the
+            # engines' readers never observe partial files.
+            weights_path = os.path.join(lora_sync_path, "adapter_model.safetensors")
+            config_path = os.path.join(lora_sync_path, "adapter_config.json")
+            save_file(adapter_state, f"{weights_path}.tmp{rank}")
+            os.replace(f"{weights_path}.tmp{rank}", weights_path)
+            with open(f"{config_path}.tmp{rank}", "w", encoding="utf-8") as f:
                 json.dump(adapter_config, f, ensure_ascii=False, indent=4)
+            os.replace(f"{config_path}.tmp{rank}", config_path)
 
+        # All nodes' files must be in place before the engines re-read them.
+        torch.distributed.barrier()
+
+        if rank == 0:
             # Send LoRA disk loading request to inference engine.
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                 RemoteInferenceClient,
