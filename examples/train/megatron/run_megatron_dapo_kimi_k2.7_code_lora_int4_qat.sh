@@ -118,12 +118,27 @@ OPTIMIZER_OFFLOAD_FRACTION=1.0
 # Kimi K2.5-family checkpoints train text-only on Megatron (vision tower stays
 # frozen in vLLM); required for KimiK25ForConditionalGeneration.
 LANGUAGE_MODEL_ONLY=True
-ENGINE_INIT_KWARGS="{\"max_model_len\": $MAX_MODEL_LEN, \"compilation_config\": {\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}}"
+# mla_prefill_backend=FLASHINFER: the default FLASH_ATTN (FA4 CuTe-DSL) MLA
+# prefill crashes against the locked nvidia-cutlass-dsl MLIR bindings; the
+# FlashInfer ragged prefill has sm103 kernels via the cu130 jit-cache.
+ENGINE_INIT_KWARGS="{\"max_model_len\": $MAX_MODEL_LEN, \"compilation_config\": {\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}, \"attention_config\": {\"mla_prefill_backend\": \"FLASHINFER\"}}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.7}"
 # Giant-model wake-up + 262k prefills need generous execute timeouts.
 export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-3600}"
 
-uv run --isolated --extra megatron -m examples.train.algorithms.dapo.main_dapo \
+# CUDA-13 stack (required on Blackwell-Ultra/B300, see pyproject): every CUDA
+# library comes from pip, so run in the project venv (no --isolated -- the env
+# below points into it and must be stable across nodes) and resolve libraries
+# from the pip cu13 set. CUDNN_PATH pins TE's cuDNN search to the pip cuDNN
+# (a system cuDNN core mixed with pip sublibraries fails with
+# CUDNN_STATUS_SUBLIBRARY_LOADING_FAILED). Export these (plus
+# SKYRL_LD_LIBRARY_PATH_EXPORT=1) before `ray start` on every node.
+SP="$(pwd)/.venv/lib/python3.12/site-packages"
+export LD_LIBRARY_PATH="$SP/nvidia/cu13/lib:$SP/nvidia/cudnn/lib:$SP/nvidia/cusparselt/lib:$SP/nvidia/nccl/lib:$SP/nvidia/nvshmem/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDNN_PATH="$SP/nvidia/cudnn"
+export SKYRL_LD_LIBRARY_PATH_EXPORT=1
+
+uv run --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator="grpo" \

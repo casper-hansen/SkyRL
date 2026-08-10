@@ -91,7 +91,9 @@ skyrl-train = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    "flash-attn==2.8.3; sys_platform == 'linux'",
+    # flash-attn: no torch-2.11/cu13 wheels upstream; a CUDA-less stub crashes
+    # TE (version-gated import of flash_attn_2_cuda), so it is omitted. HF models
+    # fall back to SDPA; TE uses cuDNN fused attention.
     "polars",
     "s3fs",
     "s5cmd>=0.3.3; sys_platform == 'linux'",
@@ -103,10 +105,10 @@ skyrl-train = [
     "vllm-router; sys_platform == 'linux'",
     "pybind11",
     "setuptools",
-    # The `nixl` shim provides that namespace and dispatches to `nixl_cu12`.
-    # `nixl-cu12` ships the `nixl_cu12` module, but vLLM imports `nixl._api`.
-    # Its metadata hard-depends on `nixl-cu13` too; that variant is overridden
-    # out below (it would drag in the CUDA-13 stack and break the cu12 torch pin).
+    # The `nixl` shim provides that namespace and dispatches to the CUDA-13
+    # variant (`nixl_cu13`); vLLM imports `nixl._api`. The metadata also
+    # hard-depends on `nixl-cu12`, which is overridden out below so it doesn't
+    # drag the CUDA-12 stack into the cu13 resolution.
     "nixl; sys_platform == 'linux'",
 ]
 
@@ -114,14 +116,16 @@ fsdp = [
     "skyrl[skyrl-train]",
     "vllm==0.23.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
-    # The `nixl` shim provides that namespace and dispatches to `nixl_cu12`.
-    # `nixl-cu12` ships the `nixl_cu12` module, but vLLM imports `nixl._api`.
-    # Its metadata hard-depends on `nixl-cu13` too; that variant is overridden
-    # out below (it would drag in the CUDA-13 stack and break the cu12 torch pin).
+    # The `nixl` shim provides that namespace and dispatches to the CUDA-13
+    # variant (`nixl_cu13`); vLLM imports `nixl._api`. The metadata also
+    # hard-depends on `nixl-cu12`, which is overridden out below so it doesn't
+    # drag the CUDA-12 stack into the cu13 resolution.
     "nixl; sys_platform == 'linux'",
     "flash-linear-attention; sys_platform == 'linux'",
     "causal-conv1d; sys_platform == 'linux'",
-    "flash-attn==2.8.3; sys_platform == 'linux'",
+    # flash-attn: no torch-2.11/cu13 wheels upstream; a CUDA-less stub crashes
+    # TE (version-gated import of flash_attn_2_cuda), so it is omitted. HF models
+    # fall back to SDPA; TE uses cuDNN fused attention.
     "torch==2.11.0; sys_platform == 'linux'",
     "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "flashinfer-jit-cache==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -136,22 +140,25 @@ megatron = [
     # [tool.uv.sources] URL below is honored — uv ignores sources for
     # transitive-only packages, which would otherwise fall back to the PyPI sdist.
     "transformer-engine-torch==2.11.0; sys_platform == 'linux'",
-    # TE core CUDA lib (libtransformer_engine.so). The meta `transformer-engine`
-    # package hardcodes `transformer-engine-cu13` as its core dep, which we
-    # override to `never` below because this image is CUDA 12.8. cu12 is the
-    # matching core — without it the meta package's sanity check fails with
-    # "Found empty `transformer-engine` meta package installed".
-    "transformer-engine-cu12==2.11.0; sys_platform == 'linux'",
-    "flash-attn==2.8.3; sys_platform == 'linux'",
+    # TE core CUDA lib (libtransformer_engine.so). The CUDA-13 core matches the
+    # cu13 torch/vllm stack and is the only TE core with Blackwell-Ultra
+    # (sm103, e.g. B300) kernel images; the cu12 variant is overridden to
+    # `never` below so the meta package's core resolution stays unambiguous.
+    "transformer-engine-cu13==2.11.0; sys_platform == 'linux'",
+    # No flash-attn: no torch-2.11/cu13 wheels exist upstream, and a
+    # CUDA-less build (FLASH_ATTENTION_SKIP_CUDA_BUILD) is worse than absence
+    # -- TE gates on the package *version* and then imports flash_attn_2_cuda
+    # unconditionally, crashing at import. Without the package TE falls back
+    # to cuDNN fused / unfused attention (the MLA path uses cuDNN anyway).
     "flash-linear-attention; sys_platform == 'linux'",
     "causal-conv1d; sys_platform == 'linux'",
     "mamba-ssm>=2.3.0; sys_platform == 'linux'",
     "vllm==0.23.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
-    # The `nixl` shim provides that namespace and dispatches to `nixl_cu12`.
-    # `nixl-cu12` ships the `nixl_cu12` module, but vLLM imports `nixl._api`.
-    # Its metadata hard-depends on `nixl-cu13` too; that variant is overridden
-    # out below (it would drag in the CUDA-13 stack and break the cu12 torch pin).
+    # The `nixl` shim provides that namespace and dispatches to the CUDA-13
+    # variant (`nixl_cu13`); vLLM imports `nixl._api`. The metadata also
+    # hard-depends on `nixl-cu12`, which is overridden out below so it doesn't
+    # drag the CUDA-12 stack into the cu13 resolution.
     "nixl; sys_platform == 'linux'",
     "torch==2.11.0; sys_platform == 'linux'",
     "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -237,10 +244,10 @@ override-dependencies = [
     "transformers>=5.6.1,<=5.8.0; sys_platform == 'linux'",
     "megatron-core>=0.16.0; sys_platform == 'linux' and python_version >= '3.12'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
-    "transformer-engine-cu13; sys_platform == 'never'",
-    # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu13 variant
-    # so it doesn't pull the CUDA-13 stack and bump torch off the cu12 pin.
-    "nixl-cu13; sys_platform == 'never'",
+    "transformer-engine-cu12; sys_platform == 'never'",
+    # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu12 variant
+    # so it doesn't drag the CUDA-12 stack into the cu13 resolution.
+    "nixl-cu12; sys_platform == 'never'",
     # Megatron-Bridge pins flashinfer-python==0.6.8.post1, which conflicts with
     # our exact 0.6.12 pin (the version vLLM 0.23.0 requires). Override it to our version.
     "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -252,6 +259,8 @@ override-dependencies = [
 flash-attn = [{requirement = "torch", match-runtime = true}]
 transformer-engine = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
 transformer-engine-torch = [{requirement = "torch", match-runtime = true}, "build_tools", "ninja"]
+causal-conv1d = [{requirement = "torch", match-runtime = true}, "ninja", "packaging"]
+mamba-ssm = [{requirement = "torch", match-runtime = true}, "ninja", "packaging", "setuptools"]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE"}
@@ -287,40 +296,40 @@ url = "https://flashinfer.ai/whl/cu129"
 explicit = true
 
 [[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
 name = "vllm-cu129"
 url = "https://wheels.vllm.ai/0.23.0/cu129"
 explicit = true
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
-# cu129 build: nvcc 12.8 cannot target Blackwell-Ultra (sm103, e.g. B300), so
-# the cu128 jit-cache has no kernel images for those GPUs ("no kernel image is
-# available" from flashinfer ops at runtime). The cu129 cache adds sm103 and
-# still links libcudart.so.12, so it coexists with torch's cu12 runtime.
-flashinfer-jit-cache = { index = "flashinfer-cu129", marker = "sys_platform == 'linux'" }
-# vllm 0.23.0's PyPI wheel needs CUDA 13 (libcudart.so.13); the cu129 wheel
-# links libcudart.so.12, which torch+cu128 supplies.
-vllm = [
-    { index = "vllm-cu129", marker = "sys_platform == 'linux'" },
-]
-# torch-2.11 wheels for these three aren't published upstream; built locally
-# on erictang000 forks (cu128 / cxx11abiTRUE / py3.12). flash-attn has its
-# +cu12torch2.11cxx11abiTRUE local-version stripped from METADATA — PEP 440
-# treats 2.8.3+local > 2.8.3, so TE's get_attention_backend (max_version=
-# "2.8.3") rejected it and silently fell back to broken unfused attention.
-flash-attn = { url = "https://github.com/erictang000/flash-attention/releases/download/v2.8.3-torch2.11-clean/flash_attn-2.8.3-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
-causal-conv1d = { url = "https://github.com/erictang000/causal-conv1d/releases/download/v1.6.1.post4-torch2.11/causal_conv1d-1.6.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
-mamba-ssm = { url = "https://github.com/erictang000/mamba/releases/download/v2.3.1-torch2.11/mamba_ssm-2.3.1-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
-# transformer-engine-torch 2.11.0 built against torch 2.11 (cu128 / cp312).
-transformer-engine-torch = { url = "https://github.com/erictang000/TransformerEngine/releases/download/v2.11.0-torch2.11/transformer_engine_torch-2.11.0-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_version == '3.12' and platform_machine == 'x86_64'" }
-# CUDA torch on Linux, CPU torch on macOS (must match skyrl-train).
-# Linux uses the cu128 index (torch 2.11 wheels are published there).
+# cu130 build to match the CUDA-13 stack. Older caches lack Blackwell-Ultra
+# (sm103, e.g. B300) kernel images: nvcc 12.8 cannot target sm103 at all, so
+# flashinfer ops fail at runtime with "no kernel image is available".
+flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }
+# vllm from PyPI: the PyPI wheel is the CUDA-13 build, whose plain sm_100
+# cubins are family-compatible with sm103 (B300) under CUDA 13 -- the cu129
+# wheel ships sm_100a/sm_120a SASS only (no sm103, no PTX) and cannot run on
+# Blackwell-Ultra. It links libcudart.so.13, supplied by torch's cu13 runtime.
+#
+# torch-2.11 wheels for flash-attn / causal-conv1d / mamba-ssm /
+# transformer-engine-torch aren't published upstream; they are built from
+# sdists at sync time against the runtime torch (see
+# tool.uv.extra-build-dependencies). Set CUDA_HOME to a CUDA >= 13.0 toolkit
+# when syncing so the extensions compile for the cu13 stack (and pick up
+# sm103 on Blackwell-Ultra build hosts). flash-attn keeps
+# FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE (no CUDA binary; TE and fla treat it
+# as absent and fall back to their fused/triton paths).
+# CUDA torch on Linux (PyPI default = CUDA 13 for torch 2.11), CPU torch on
+# macOS (must match skyrl-train).
 torch = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
 torchvision = [
-    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
     { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
 ]
 harbor = { git = "https://github.com/laude-institute/harbor", rev = "3de07a0e01f3368921766437fc7afece3ddec23d" }
