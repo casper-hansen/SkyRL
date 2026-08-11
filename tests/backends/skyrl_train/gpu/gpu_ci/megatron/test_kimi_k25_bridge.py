@@ -163,6 +163,9 @@ def _kimi_worker_cfg(lora_sync_path: str) -> SkyRLTrainConfig:
     lora.target_modules = ["linear_proj", "linear_fc1", "linear_fc2"]
     lora.lora_sync_path = lora_sync_path
     cfg.trainer.policy.megatron_config.lora_config.merge_lora = False
+    # Capacity-normalized expert LoRA, as the Kimi example uses (expert rank =
+    # rank/topk; keeps the per-expert PEFT export small for 384 experts).
+    cfg.trainer.policy.megatron_config.lora_config.normalize_moe_lora = True
 
     fq = cfg.trainer.policy.model.fake_int4_qat
     fq.enabled = True
