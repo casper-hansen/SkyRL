@@ -100,6 +100,10 @@ LORA_ALPHA="${LORA_ALPHA:-32}"
 # targets attention-out + all MLPs (dense, shared expert, and the 384 routed
 # experts -- the routed experts carry ~96% of the parameters).
 LORA_TARGET_MODULES="['linear_proj','linear_fc1','linear_fc2']"
+# Capacity-normalized expert LoRA (rank/topk for the grouped experts). Without
+# this, the per-expert PEFT export at rank 32 is ~41 GB for 384 experts x 60
+# layers -- gathered, written, and re-read by every engine each weight sync.
+NORMALIZE_MOE_LORA="${NORMALIZE_MOE_LORA:-true}"
 
 # megatron config (16 GPUs: TP=2 x CP=8 x DP=1, EP=16/ETP=1, PP=1)
 # BF16 masters/GPU: ~127 GB experts (60 layers x 24 experts) + ~12 GB rest.
@@ -137,8 +141,14 @@ SP="$(pwd)/.venv/lib/python3.12/site-packages"
 export LD_LIBRARY_PATH="$SP/nvidia/cu13/lib:$SP/nvidia/cudnn/lib:$SP/nvidia/cusparselt/lib:$SP/nvidia/nccl/lib:$SP/nvidia/nvshmem/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CUDNN_PATH="$SP/nvidia/cudnn"
 export SKYRL_LD_LIBRARY_PATH_EXPORT=1
+# Ray workers execute `uv run` from Ray's *copied* working dir (no .venv
+# there); pin the project env by absolute path so --no-sync finds it.
+export UV_PROJECT_ENVIRONMENT="$(pwd)/.venv"
 
-uv run --extra megatron -m examples.train.algorithms.dapo.main_dapo \
+# --no-sync: the venv is prepared once per node before `ray start`; Ray's uv
+# hook re-runs this exact command per worker, and concurrent implicit syncs
+# from many workers can race on the shared venv.
+uv run --no-sync --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator="grpo" \
@@ -182,6 +192,7 @@ uv run --extra megatron -m examples.train.algorithms.dapo.main_dapo \
   trainer.policy.model.lora.rank=$LORA_RANK \
   trainer.policy.model.lora.alpha=$LORA_ALPHA \
   trainer.policy.model.lora.target_modules="$LORA_TARGET_MODULES" \
+  trainer.policy.megatron_config.lora_config.normalize_moe_lora=$NORMALIZE_MOE_LORA \
   trainer.policy.megatron_config.optimizer_config_kwargs.overlap_cpu_optimizer_d2h_h2d=$OPTIMIZER_OFFLOAD \
   trainer.policy.megatron_config.optimizer_config_kwargs.use_precision_aware_optimizer=$OPTIMIZER_OFFLOAD \
   trainer.policy.megatron_config.optimizer_config_kwargs.optimizer_cpu_offload=$OPTIMIZER_OFFLOAD \

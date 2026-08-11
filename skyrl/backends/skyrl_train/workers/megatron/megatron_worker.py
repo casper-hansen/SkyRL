@@ -573,6 +573,7 @@ class MegatronWorker:
                 lora_B_init_method="zero",
                 exclude_modules=[] if lora_config.exclude_modules is None else lora_config.exclude_modules,
                 lora_dtype=torch.bfloat16 if self.cfg.bf16 else torch.float32,
+                normalize_moe_lora=self.cfg.policy.megatron_config.lora_config.normalize_moe_lora,
             )
         elif lora_type == "canonical_lora":
             self.lora_cls = CanonicalLoRA(
@@ -1427,12 +1428,23 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         )
         from safetensors.torch import save_file
 
+        # Every rank must participate in the bridge's collective export, but only
+        # the per-node writer ranks materialize the gathered tensors: with MoE
+        # expert adapters the full float32 adapter state can reach tens of GB
+        # (per-expert replication), and keeping a copy on all ranks multiplies
+        # the CPU spike by ranks-per-node (enough to OOM a node during sync).
+        keep_state = self._is_lora_sync_writer_rank()
         adapter_state = {}
         for name, tensor in self.bridge.export_adapter_weights(self.actor_module, cpu=True, show_progress=False):
-            adapter_state[f"base_model.model.{name}"] = tensor.clone().float()
+            if keep_state:
+                # Keep the training dtype (bf16): upcasting to float32 doubles
+                # the already-large per-expert adapter state (and the file the
+                # engines re-read every step) for no fidelity gain -- vLLM casts
+                # adapters to its lora dtype on load.
+                adapter_state[f"base_model.model.{name}"] = tensor.clone()
 
         rank = torch.distributed.get_rank()
-        if self._is_lora_sync_writer_rank():
+        if keep_state:
             os.makedirs(lora_sync_path, exist_ok=True)
 
             # Rewrite fused-MoE expert LoRA into vLLM's flat PEFT layout so
