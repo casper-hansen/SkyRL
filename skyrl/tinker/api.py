@@ -581,6 +581,124 @@ def _decode_forward_backward_pb(body: bytes) -> tuple[ForwardBackwardRequest, bo
     return ForwardBackwardRequest(model_id=msg.model_id, forward_backward_input=fb_input), bool(msg.forward_only)
 
 
+_PROTO_MASK_LOGPROB = -99999.0  # tinker SDK sentinel for masked topk rows
+
+
+def _encode_forward_backward_output_pb(result: dict) -> bytes:
+    """Encode a stored ForwardBackwardOutput result dict as proto bytes.
+
+    Inverse of the SDK's ``deserialize_forward_backward_output``: one
+    ArrayRecord carrying every datum, each field a BatchedTensor of the
+    per-datum flat arrays with int64 byte offsets. Per-datum vectors are
+    flat, so ``trailing_shape`` stays empty.
+    """
+    import numpy as np
+
+    public_pb = _proto_module()
+    msg = public_pb.ForwardBackwardOutput()
+    msg.loss_fn_output_type = str(result.get("loss_fn_output_type") or "ArrayRecord")
+    for key, value in (result.get("metrics") or {}).items():
+        try:
+            msg.metrics[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+
+    outputs = result.get("loss_fn_outputs") or []
+    if not outputs:
+        return msg.SerializeToString()
+
+    record = msg.loss_fn_outputs.add()
+    record.type_tag = msg.loss_fn_output_type
+    record.num_datums = len(outputs)
+
+    field_names: list[str] = []
+    for datum in outputs:
+        for name in datum:
+            if name not in field_names:
+                field_names.append(name)
+
+    for name in field_names:
+        dtype_label = "float32"
+        for datum in outputs:
+            td = datum.get(name)
+            if isinstance(td, dict) and td.get("dtype"):
+                dtype_label = td["dtype"]
+                break
+        np_dtype = np.int64 if dtype_label == "int64" else np.float32
+        proto_dtype = public_pb.DTYPE_INT64 if dtype_label == "int64" else public_pb.DTYPE_FLOAT32
+
+        flats = []
+        for datum in outputs:
+            td = datum.get(name)
+            data = td.get("data", []) if isinstance(td, dict) else (td or [])
+            flats.append(np.asarray(data, dtype=np_dtype).reshape(-1))
+        offsets = np.zeros(len(flats) + 1, dtype=np.int64)
+        for i, arr in enumerate(flats):
+            offsets[i + 1] = offsets[i] + arr.nbytes
+
+        bt = record.fields[name]
+        bt.data = b"".join(arr.tobytes() for arr in flats)
+        bt.offsets = offsets.tobytes()
+        bt.dtype = proto_dtype
+    return msg.SerializeToString()
+
+
+def _encode_sample_response_pb(result: dict) -> bytes:
+    """Encode a stored SampleOutput result dict as a proto SampleResponse."""
+    import math as _math
+
+    import numpy as np
+
+    public_pb = _proto_module()
+    msg = public_pb.SampleResponse()
+    for seq in result.get("sequences") or []:
+        seq_pb = msg.sequences.add()
+        seq_pb.stop_reason = (
+            public_pb.STOP_REASON_STOP if seq.get("stop_reason") == "stop" else public_pb.STOP_REASON_LENGTH
+        )
+        seq_pb.tokens = np.asarray(seq.get("tokens") or [], dtype=np.int32).tobytes()
+        logprobs = seq.get("logprobs")
+        if logprobs:
+            seq_pb.logprobs = np.asarray(logprobs, dtype=np.float32).tobytes()
+
+    prompt_logprobs = result.get("prompt_logprobs")
+    if prompt_logprobs:
+        arr = np.asarray(
+            [float("nan") if x is None else float(x) for x in prompt_logprobs],
+            dtype=np.float32,
+        )
+        msg.prompt_logprobs = arr.tobytes()
+
+    topk = result.get("topk_prompt_logprobs")
+    if topk:
+        k = max((len(row) for row in topk if row), default=0)
+        n = len(topk)
+        if n and k:
+            token_ids = np.zeros((n, k), dtype=np.int32)
+            logprobs = np.full((n, k), _PROTO_MASK_LOGPROB, dtype=np.float32)
+            for i, row in enumerate(topk):
+                if not row:
+                    continue  # all-masked row decodes to None client-side
+                for j, pair in enumerate(row[:k]):
+                    token_ids[i, j] = int(pair[0])
+                    logprobs[i, j] = float(pair[1])
+                    if not _math.isfinite(logprobs[i, j]):
+                        logprobs[i, j] = _PROTO_MASK_LOGPROB
+            msg.topk_prompt_logprobs.token_ids = token_ids.tobytes()
+            msg.topk_prompt_logprobs.logprobs = logprobs.tobytes()
+            msg.topk_prompt_logprobs.prompt_length = n
+            msg.topk_prompt_logprobs.k = k
+    return msg.SerializeToString()
+
+
+_PROTO_RESULT_ENCODERS = {
+    types.RequestType.FORWARD_BACKWARD: _encode_forward_backward_output_pb,
+    types.RequestType.FORWARD: _encode_forward_backward_output_pb,
+    types.RequestType.SAMPLE: _encode_sample_response_pb,
+    types.RequestType.EXTERNAL: _encode_sample_response_pb,
+}
+
+
 async def _parse_forward_backward_body(raw_request: Request) -> tuple[ForwardBackwardRequest, bool]:
     """Decode a forward_backward body in either wire format.
 
@@ -1318,6 +1436,21 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
                     future = result.first()
 
                     if future.status == RequestStatus.COMPLETED:
+                        # SDK >= 0.25 only accepts forward_backward/sample results as
+                        # proto (it sends Accept: application/x-protobuf and raises on
+                        # a JSON body for those types). Encode on demand; fall back to
+                        # JSON for clients that don't ask.
+                        encoder = _PROTO_RESULT_ENCODERS.get(future.request_type)
+                        if (
+                            encoder is not None
+                            and future.result_data is not None
+                            and "error" not in future.result_data
+                            and _PROTO_CONTENT_TYPE in req.headers.get("accept", "")
+                        ):
+                            return fastapi.Response(
+                                content=encoder(future.result_data),
+                                media_type=_PROTO_CONTENT_TYPE,
+                            )
                         return future.result_data
 
                     if future.status == RequestStatus.FAILED:
