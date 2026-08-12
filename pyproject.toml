@@ -91,9 +91,7 @@ skyrl-train = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    # flash-attn: no torch-2.11/cu13 wheels upstream; a CUDA-less stub crashes
-    # TE (version-gated import of flash_attn_2_cuda), so it is omitted. HF models
-    # fall back to SDPA; TE uses cuDNN fused attention.
+    # flash-attn omitted: no torch-2.11/cu13 wheels (see the megatron extra note).
     "polars",
     "s3fs",
     "s5cmd>=0.3.3; sys_platform == 'linux'",
@@ -123,9 +121,7 @@ fsdp = [
     "nixl; sys_platform == 'linux'",
     "flash-linear-attention; sys_platform == 'linux'",
     "causal-conv1d; sys_platform == 'linux'",
-    # flash-attn: no torch-2.11/cu13 wheels upstream; a CUDA-less stub crashes
-    # TE (version-gated import of flash_attn_2_cuda), so it is omitted. HF models
-    # fall back to SDPA; TE uses cuDNN fused attention.
+    # flash-attn omitted: no torch-2.11/cu13 wheels (see the megatron extra note).
     "torch==2.11.0; sys_platform == 'linux'",
     "flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "flashinfer-jit-cache==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'",
@@ -244,6 +240,8 @@ override-dependencies = [
     "transformers>=5.6.1,<=5.8.0; sys_platform == 'linux'",
     "megatron-core>=0.16.0; sys_platform == 'linux' and python_version >= '3.12'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
+    # `transformer-engine-torch` hard-depends on the cu12 core; block it so the
+    # cu13 core (declared in the megatron extra) is the only one installed.
     "transformer-engine-cu12; sys_platform == 'never'",
     # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu12 variant
     # so it doesn't drag the CUDA-12 stack into the cu13 resolution.
@@ -316,14 +314,11 @@ flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == '
 # wheel ships sm_100a/sm_120a SASS only (no sm103, no PTX) and cannot run on
 # Blackwell-Ultra. It links libcudart.so.13, supplied by torch's cu13 runtime.
 #
-# torch-2.11 wheels for flash-attn / causal-conv1d / mamba-ssm /
-# transformer-engine-torch aren't published upstream; they are built from
-# sdists at sync time against the runtime torch (see
-# tool.uv.extra-build-dependencies). Set CUDA_HOME to a CUDA >= 13.0 toolkit
-# when syncing so the extensions compile for the cu13 stack (and pick up
-# sm103 on Blackwell-Ultra build hosts). flash-attn keeps
-# FLASH_ATTENTION_SKIP_CUDA_BUILD=TRUE (no CUDA binary; TE and fla treat it
-# as absent and fall back to their fused/triton paths).
+# torch-2.11 wheels for causal-conv1d / mamba-ssm / transformer-engine-torch
+# aren't published upstream; they are built from sdists at sync time against
+# the runtime torch (see tool.uv.extra-build-dependencies). Set CUDA_HOME to a
+# CUDA >= 13.0 toolkit when syncing so the extensions compile for the cu13
+# stack (and pick up sm103 on Blackwell-Ultra build hosts).
 # CUDA torch on Linux (PyPI default = CUDA 13 for torch 2.11), CPU torch on
 # macOS (must match skyrl-train).
 torch = [
