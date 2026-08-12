@@ -105,8 +105,10 @@ train/infer mismatch (same toggle as the Qwen3.6 INT4 study).
   written once per node (each vLLM worker reads `lora_sync_path` from its
   local filesystem), so no shared filesystem is required.
 - **Blackwell-Ultra (B300 / sm103)** needs the CUDA-13 dependency stack (the
-  cu12x vLLM wheels ship no sm103 kernel images); see the comments in
-  `pyproject.toml` and the environment block in the run script.
+  cu12x vLLM wheels ship no sm103 kernel images): install it with
+  `bash deploy/cuda13/install.sh` (see `deploy/cuda13/README.md`; NVIDIA
+  driver >= R580 and a CUDA >= 13.0 toolkit required), and see the
+  environment block in the run script for the runtime library paths.
 - The LoRA targets deliberately exclude the MLA q/kv projections: mcore names
   them differently (`linear_q_down_proj`, ...) and vLLM's MLA weight
   absorption does not apply adapters to `kv_b_proj`.
