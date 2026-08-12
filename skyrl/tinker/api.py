@@ -498,6 +498,127 @@ class ForwardRequest(BaseModel):
     forward_input: ForwardBackwardInput
 
 
+# ---------------------------------------------------------------------------
+# Protobuf wire-format support for /api/v1/forward_backward.
+#
+# tinker SDK >= 0.25 serializes ForwardBackwardRequest as protobuf
+# (Content-Type: application/x-protobuf, optionally zstd Content-Encoding) and
+# has no JSON fallback; older SDKs (<= 0.24) switch to the same proto path when
+# the server advertises `proto_write_fwdbwd` in /api/v1/client/config. The
+# decoder below converts the proto message into the existing pydantic request
+# models so the rest of the pipeline is wire-format agnostic. The proto schema
+# ships with the `tinker` package (a dependency of the `tinker` extra).
+# ---------------------------------------------------------------------------
+
+_PROTO_CONTENT_TYPE = "application/x-protobuf"
+
+
+def _proto_module():
+    try:
+        from tinker.proto import tinker_public_pb2 as public_pb
+    except ImportError as exc:  # pragma: no cover - tinker extra always ships it
+        raise HTTPException(
+            status_code=415,
+            detail="This server cannot decode application/x-protobuf bodies "
+            f"(tinker proto schema unavailable: {exc}). Send application/json.",
+        ) from exc
+    return public_pb
+
+
+def _decode_tensor_pb(tensor, public_pb) -> TensorData:
+    import numpy as np
+
+    encoding = tensor.WhichOneof("encoding")
+    if encoding != "dense":
+        raise HTTPException(status_code=422, detail=f"unsupported tensor encoding {encoding!r} (only dense)")
+    dtype_map = {
+        public_pb.DTYPE_FLOAT32: np.float32,
+        public_pb.DTYPE_INT64: np.int64,
+        public_pb.DTYPE_INT32: np.int32,
+    }
+    np_dtype = dtype_map.get(tensor.dtype)
+    if np_dtype is None:
+        raise HTTPException(status_code=422, detail=f"unsupported tensor dtype enum {tensor.dtype}")
+    values = np.frombuffer(tensor.dense, dtype=np_dtype)
+    return TensorData(data=values.tolist())
+
+
+def _decode_chunk_pb(chunk) -> EncodedTextChunk:
+    import numpy as np
+
+    which = chunk.WhichOneof("chunk")
+    if which != "encoded_text":
+        # Image/audio chunks additionally require the server-side asset upload
+        # path the managed service uses; reject clearly rather than mangle.
+        raise HTTPException(status_code=422, detail=f"unsupported model-input chunk type {which!r} on the proto path")
+    tokens = np.frombuffer(chunk.encoded_text.tokens, dtype=np.int32)
+    return EncodedTextChunk(tokens=tokens.tolist())
+
+
+def _decode_forward_backward_pb(body: bytes) -> tuple[ForwardBackwardRequest, bool]:
+    """Parse a proto ForwardBackwardRequest; returns (request, forward_only)."""
+    public_pb = _proto_module()
+    msg = public_pb.ForwardBackwardRequest()
+    try:
+        msg.ParseFromString(body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid protobuf ForwardBackwardRequest: {exc}") from exc
+
+    data = []
+    for datum_pb in msg.data:
+        chunks = [_decode_chunk_pb(c) for c in datum_pb.model_input]
+        loss_fn_inputs = {key: _decode_tensor_pb(value, public_pb) for key, value in datum_pb.loss_fn_inputs.items()}
+        data.append(Datum(model_input=ModelInput(chunks=chunks), loss_fn_inputs=loss_fn_inputs))
+
+    try:
+        fb_input = ForwardBackwardInput(
+            data=data,
+            loss_fn=msg.loss_fn,
+            loss_fn_config=dict(msg.loss_fn_config) if msg.loss_fn_config else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid forward_backward payload: {exc}") from exc
+    return ForwardBackwardRequest(model_id=msg.model_id, forward_backward_input=fb_input), bool(msg.forward_only)
+
+
+async def _parse_forward_backward_body(raw_request: Request) -> tuple[ForwardBackwardRequest, bool]:
+    """Decode a forward_backward body in either wire format.
+
+    JSON (SDK <= 0.24 default) and protobuf (SDK >= 0.25, or older SDKs when
+    `proto_write_fwdbwd` is advertised) are both accepted; anything else gets
+    a clean 415 instead of a 500 from FastAPI trying to utf-8 decode binary.
+    """
+    body = await raw_request.body()
+    if raw_request.headers.get("content-encoding", "").strip().lower() == "zstd":
+        import zstandard
+
+        try:
+            body = zstandard.ZstdDecompressor().decompress(body)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"failed to zstd-decompress request body: {exc}") from exc
+
+    content_type = raw_request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type == _PROTO_CONTENT_TYPE:
+        return _decode_forward_backward_pb(body)
+    if content_type in ("application/json", ""):
+        try:
+            return ForwardBackwardRequest.model_validate_json(body), False
+        except Exception as exc:
+            import pydantic
+
+            if isinstance(exc, pydantic.ValidationError):
+                # exc.json() is fully JSON-safe (unlike FastAPI's default
+                # encoder, which crashes on bytes in the error context).
+                import json as _json
+
+                raise HTTPException(status_code=422, detail=_json.loads(exc.json())) from exc
+            raise HTTPException(status_code=422, detail=f"invalid JSON body: {exc}") from exc
+    raise HTTPException(
+        status_code=415,
+        detail=f"Unsupported content type {content_type!r}; send application/json or {_PROTO_CONTENT_TYPE}",
+    )
+
+
 class AdamParams(BaseModel):
     learning_rate: float = Field(default=1e-4, ge=0.0)
     beta1: float = Field(default=0.9, ge=0.0, lt=1.0)
@@ -728,6 +849,12 @@ class WeightsInfoResponse(BaseModel):
 
 class ClientConfigResponse(BaseModel):
     pjwt_auth_enabled: bool = False
+    # Advertise the protobuf forward_backward path: SDK >= 0.25 requires it
+    # (its forward() asserts the flag and it has no JSON fallback), and older
+    # SDKs switch to proto when the flag is set. /api/v1/forward_backward
+    # decodes both wire formats either way.
+    proto_write_fwdbwd: bool = True
+    proto_compress_fwdbwd: bool = False
 
 
 @app.post("/api/v1/client/config", response_model=ClientConfigResponse)
@@ -921,13 +1048,19 @@ async def get_training_run(model_id: str, session: AsyncSession = Depends(get_se
 
 
 @app.post("/api/v1/forward_backward", response_model=FutureResponse)
-async def forward_backward(request: ForwardBackwardRequest, session: AsyncSession = Depends(get_session)):
-    """Compute and accumulate gradients."""
+async def forward_backward(raw_request: Request, session: AsyncSession = Depends(get_session)):
+    """Compute and accumulate gradients.
+
+    Accepts JSON or protobuf bodies (see :func:`_parse_forward_backward_body`).
+    The proto schema carries a ``forward_only`` flag instead of using the
+    separate /forward route; honor it by dispatching the request type.
+    """
+    request, forward_only = await _parse_forward_backward_body(raw_request)
     await get_model(session, request.model_id)
 
     request_id = await create_future(
         session=session,
-        request_type=types.RequestType.FORWARD_BACKWARD,
+        request_type=types.RequestType.FORWARD if forward_only else types.RequestType.FORWARD_BACKWARD,
         model_id=request.model_id,
         request_data=request.forward_backward_input.to_types(),
     )
