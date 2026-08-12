@@ -1049,12 +1049,24 @@ class SkyRLTrainBackend(AbstractBackend):
         # Resolve the inference-engine model name per request. With multi-LoRA
         # the adapter name on vLLM IS the Tinker model_id (registered by
         # save_sampler_checkpoint via load_lora_adapter). Single-tenant /
-        # FFT path falls back to resolve_policy_model_name(cfg).
+        # FFT path falls back to resolve_policy_model_name(cfg). An empty
+        # model_id is base-model sampling and must target the served base
+        # model directly: resolve_policy_model_name would return the LoRA
+        # adapter alias under LoRA weight sync, which (a) does not exist on
+        # the engines until the first sampler-weight save and (b) would wrongly
+        # apply adapter deltas to a base-model request.
         fallback_model_name = resolve_policy_model_name(self._cfg)
-        per_request_models = [
-            mid if (self._base_lora_signature is not None and mid in self._model_ids_to_role) else fallback_model_name
-            for mid in prepared_batch.all_model_ids
-        ]
+        base_model_name = (
+            self._cfg.generator.inference_engine.served_model_name or self._cfg.trainer.policy.model.path
+        )
+        per_request_models = []
+        for mid in prepared_batch.all_model_ids:
+            if not mid:
+                per_request_models.append(base_model_name)
+            elif self._base_lora_signature is not None and mid in self._model_ids_to_role:
+                per_request_models.append(mid)
+            else:
+                per_request_models.append(fallback_model_name)
 
         # Prompt logprobs are a property of the prompt, and all `num_samples`
         # samples of a request share one prompt, so only ask for them on the
