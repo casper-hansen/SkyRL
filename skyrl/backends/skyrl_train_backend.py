@@ -422,6 +422,14 @@ class SkyRLTrainBackend(AbstractBackend):
         if self._inference_engines_initialized:
             return
 
+        # A preceding training op (another tenant's forward/forward_backward)
+        # may have left the trainer GPU-resident; under colocate_all the
+        # engines' startup allocation (gpu_memory_utilization of each GPU)
+        # then OOMs. Offload the trainer before bringing the engines up --
+        # the same order the build path uses (build -> offload -> engines).
+        if self._dispatch is not None:
+            self._dispatch.offload_for_sampling("policy")
+
         self._create_new_inference_client()
 
         self._dispatch.set_inference_engine_client(self._inference_engine_client)
