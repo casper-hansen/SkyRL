@@ -1414,8 +1414,26 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             self._lora_sync_writer_cache = cached
         return cached
 
+    async def save_lora_adapters(self, model_id: Optional[str] = None) -> tuple[str, str]:
+        """Collectively export + write the live LoRA adapter; no engine calls.
+
+        Returns ``(lora_name, lora_sync_path)`` so the caller (the dispatch in
+        the engine process) can issue the engine load itself once the engines
+        are awake. The frozen masters must be GPU-resident: the bridge's
+        collective export hangs when it runs against offloaded params.
+        """
+        lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
+        await self._save_lora_adapters_and_sync(
+            lora_sync_path, None, lora_name=lora_name, send_load_request=False
+        )
+        return lora_name, lora_sync_path
+
     async def _save_lora_adapters_and_sync(
-        self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
+        self,
+        lora_sync_path,
+        inference_engine_client,
+        lora_name: str = SKYRL_LORA_ADAPTER_NAME,
+        send_load_request: bool = True,
     ):
         """Export LoRA adapter weights via Megatron-Bridge and tell the inference engine to load them.
 
@@ -1485,7 +1503,7 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         # All nodes' files must be in place before the engines re-read them.
         torch.distributed.barrier()
 
-        if rank == 0:
+        if rank == 0 and send_load_request:
             # Send LoRA disk loading request to inference engine.
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
                 RemoteInferenceClient,

@@ -805,6 +805,15 @@ class SkyRLTrainBackend(AbstractBackend):
             # TODO(team): remove once vllm fixes this
             # otherwise waking it up will output gibberish: https://github.com/vllm-project/vllm/issues/17103
             sleep_level = 1 if lora_cfg and lora_cfg.rank > 0 else 2
+            # For TB-scale models the level-1 CPU backup (~1.3TB/node pinned
+            # for Kimi K2.7) plus the trainer's own offload buffers exceeds
+            # host RAM and NUMA-OOMs the bring-up. SKYRL_LORA_SLEEP_LEVEL=2
+            # opts LoRA runs into discard-and-reload sleeps (weights re-read
+            # from page cache on wake); only set it after verifying wake
+            # output sanity on the deployed vLLM (the linked gibberish bug).
+            _lora_sleep_override = os.environ.get("SKYRL_LORA_SLEEP_LEVEL")
+            if _lora_sleep_override in ("1", "2"):
+                sleep_level = int(_lora_sleep_override)
             asyncio.run(self._inference_engine_client.sleep(level=sleep_level))
             self._engines_asleep = True
 
@@ -1339,15 +1348,29 @@ class SkyRLTrainBackend(AbstractBackend):
         # Lazily create inference engines on first sampling-related call
         self._ensure_inference_engines()
 
-        # The colocated sync dance (wake weights -> broadcast -> wake KV cache)
-        # assumes engines start asleep; a preceding sample leaves them awake.
-        self._sleep_inference_engines()
+        lora_cfg = self._cfg.trainer.policy.model.lora
+        adapter_only_sync = (
+            self._cfg.trainer.strategy == "megatron"
+            and lora_cfg
+            and lora_cfg.rank > 0
+            and not self._cfg.trainer.policy.megatron_config.lora_config.merge_lora
+        )
+        if not adapter_only_sync:
+            # The classic colocated sync dance (wake weights -> broadcast ->
+            # wake KV cache) assumes engines start asleep; a preceding sample
+            # leaves them awake.
+            self._sleep_inference_engines()
+        # The adapter-only path loads the LoRA into the engines wherever they
+        # are: awake engines take the load live (no pointless sleep/wake
+        # cycle), asleep engines get woken by the dispatch.
 
         # Multi-LoRA: pass model_id so the dispatch swaps the right adapter in
         # before broadcasting and the worker registers it on vLLM under that
         # name. None for the FFT / single-tenant path uses legacy behavior.
         sync_id = model_id if self._base_lora_signature is not None else None
-        asyncio.run(self._dispatch.save_weights_for_sampler(model_id=sync_id))
+        asyncio.run(
+            self._dispatch.save_weights_for_sampler(model_id=sync_id, engines_asleep=self._engines_asleep)
+        )
         # The colocated sync path leaves the engines awake (weights + KV cache).
         self._engines_asleep = False
         logger.info(f"Synced weights for {model_id} to inference engines via NCCL")
