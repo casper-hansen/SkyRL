@@ -50,7 +50,7 @@ anyio==4.14.1
     #   sse-starlette
     #   starlette
     #   watchfiles
-apache-tvm-ffi==0.1.9 ; sys_platform == 'linux'
+apache-tvm-ffi==0.1.10 ; sys_platform == 'linux'
     # via
     #   flashinfer-python
     #   quack-kernels
@@ -239,14 +239,14 @@ flash-linear-attention==0.5.1 ; sys_platform == 'linux'
     # via
     #   megatron-bridge
     #   skyrl
-flashinfer-cubin==0.6.12 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+flashinfer-cubin==0.6.13 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via
     #   megatron-bridge
     #   skyrl
     #   vllm
-flashinfer-jit-cache==0.6.12+cu130 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+flashinfer-jit-cache==0.6.13+cu130 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via skyrl
-flashinfer-python==0.6.12 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+flashinfer-python==0.6.13 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via
     #   megatron-bridge
     #   skyrl
@@ -383,7 +383,7 @@ huggingface-hub==1.20.1
     #   timm
     #   tokenizers
     #   transformers
-humming-kernels==0.1.4 ; sys_platform == 'linux'
+humming-kernels==0.1.10 ; sys_platform == 'linux'
     # via vllm
 hydra-core==1.3.2
     # via
@@ -479,7 +479,7 @@ megatron-core @ git+https://github.com/NVIDIA/Megatron-LM@71e418ea7d7b3a6c9a5323
     # via
     #   megatron-bridge
     #   skyrl
-mistral-common==1.11.3 ; sys_platform == 'linux'
+mistral-common==1.11.7 ; sys_platform == 'linux'
     # via
     #   megatron-bridge
     #   vllm
@@ -649,17 +649,21 @@ nvidia-cusparse==12.6.3.3 ; sys_platform == 'linux'
     #   nvidia-cusolver
 nvidia-cusparselt-cu13==0.8.0 ; sys_platform == 'linux'
     # via torch
-nvidia-cutlass-dsl==4.5.2 ; sys_platform == 'linux'
+nvidia-cutlass-dsl==4.6.0 ; sys_platform == 'linux'
     # via
     #   flashinfer-python
     #   quack-kernels
     #   tokenspeed-mla
     #   vllm
-nvidia-cutlass-dsl-libs-base==4.5.2 ; sys_platform == 'linux'
+nvidia-cutlass-dsl-libs-base==4.6.0 ; sys_platform == 'linux'
     # via
     #   nvidia-cutlass-dsl
     #   nvidia-cutlass-dsl-libs-cu13
-nvidia-cutlass-dsl-libs-cu13==4.5.2 ; sys_platform == 'linux'
+nvidia-cutlass-dsl-libs-core==4.6.0 ; sys_platform == 'linux'
+    # via nvidia-cutlass-dsl
+nvidia-cutlass-dsl-libs-cu12==4.6.0 ; sys_platform == 'linux'
+    # via nvidia-cutlass-dsl
+nvidia-cutlass-dsl-libs-cu13==4.6.0 ; sys_platform == 'linux'
     # via nvidia-cutlass-dsl
 nvidia-ml-py==13.610.43 ; sys_platform == 'linux'
     # via
@@ -685,6 +689,8 @@ nvidia-nvvm==13.2.78 ; sys_platform == 'linux'
     #   cuda-tile
     #   nvidia-cuda-nvcc
     #   nvidia-cuda-tileiras
+nvtx==0.2.15 ; sys_platform == 'linux'
+    # via vllm
 oauthlib==3.3.1
     # via requests-oauthlib
 omegaconf==2.3.1
@@ -915,6 +921,8 @@ pygments==2.20.0
     # via rich
 pyjwt==2.13.0 ; sys_platform == 'linux'
     # via mcp
+pynvvideocodec==2.0.4 ; sys_platform == 'linux'
+    # via vllm
 pyparsing==3.3.2 ; python_full_version >= '3.12' and sys_platform == 'linux'
     # via matplotlib
 python-box==6.1.0 ; python_full_version >= '3.12' and sys_platform == 'linux'
@@ -961,7 +969,7 @@ pyyaml==6.0.3
     #   wandb
 pyzmq==27.1.0 ; sys_platform == 'linux'
     # via vllm
-quack-kernels==0.5.0 ; sys_platform == 'linux'
+quack-kernels==0.6.1 ; sys_platform == 'linux'
     # via vllm
 qwen-vl-utils==0.0.14 ; python_full_version >= '3.12' and sys_platform == 'linux'
     # via megatron-bridge
@@ -1146,7 +1154,7 @@ tokenizers==0.22.2
     #   skyrl
     #   transformers
     #   vllm
-tokenspeed-mla==0.1.2 ; sys_platform == 'linux'
+tokenspeed-mla==0.1.8 ; sys_platform == 'linux'
     # via vllm
 tokenspeed-triton==3.7.10.post20260531 ; sys_platform == 'linux'
     # via tokenspeed-mla
@@ -1202,6 +1210,8 @@ torchaudio==2.11.0 ; sys_platform == 'linux'
     # via vllm
 torchdata==0.11.0
     # via skyrl
+torchcodec==0.16.0 ; sys_platform == 'linux'
+    # via vllm
 torchvision==0.26.0 ; sys_platform == 'linux'
     # via
     #   open-clip-torch
@@ -1327,9 +1337,9 @@ uvicorn==0.49.0
     #   vllm-router
 uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
     # via uvicorn
-vllm==0.23.0 ; sys_platform == 'linux'
+vllm==0.26.0 ; sys_platform == 'linux'
     # via skyrl
-vllm-router==0.1.14 ; platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'
+vllm-router==0.1.14.post1 ; platform_machine != 'aarch64' and platform_machine != 'x86_64' and sys_platform == 'linux'
     # via skyrl
 vllm-router @ https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_28_aarch64.whl ; platform_machine == 'aarch64' and sys_platform == 'linux'
     # via skyrl
@@ -1364,7 +1374,7 @@ wrapt==2.2.2
     #   comet-ml
 wurlitzer==3.1.1 ; python_full_version >= '3.12' and sys_platform == 'linux'
     # via comet-ml
-xgrammar==0.2.2 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and sys_platform == 'linux') or (platform_machine == 's390x' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
+xgrammar==0.2.3 ; (platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and sys_platform == 'linux') or (platform_machine == 's390x' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')
     # via vllm
 xxhash==3.7.1
     # via

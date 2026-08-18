@@ -17,7 +17,10 @@ nixl-cu12; sys_platform == 'never'
 # No torch-2.11/cu13 flash-attn exists; a CUDA-less stub crashes TE.
 flash-attn; sys_platform == 'never'
 # Megatron-Bridge pins flashinfer-python==0.6.8.post1, which conflicts with
-# the exact 0.6.12 pin (the version vLLM 0.23.0 requires).
-flashinfer-python==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'
-flashinfer-jit-cache==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'
-flashinfer-cubin==0.6.12; sys_platform == 'linux' and platform_machine == 'x86_64'
+# the pinned set. vLLM 0.26.0's metadata asks for 0.6.14, but flashinfer-cubin
+# was never released at 0.6.14 and flashinfer hard-errors on a cubin/python
+# version mismatch, so all three are held at 0.6.13 (matching the root
+# project's override-dependencies).
+flashinfer-python==0.6.13; sys_platform == 'linux' and platform_machine == 'x86_64'
+flashinfer-jit-cache==0.6.13; sys_platform == 'linux' and platform_machine == 'x86_64'
+flashinfer-cubin==0.6.13; sys_platform == 'linux' and platform_machine == 'x86_64'
