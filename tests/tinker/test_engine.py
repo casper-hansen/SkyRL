@@ -598,6 +598,20 @@ def test_blocking_op_defers_new_sample_admission(continuous_engine):
     assert _wait_for(lambda: _future_status(engine, rid_sample) == RequestStatus.COMPLETED, timeout=3.0)
 
 
+def test_admission_fails_unknown_models_without_touching_backend(continuous_engine):
+    """Stale requests for unloaded models (e.g. from a previous server) must
+    be failed by the admission filter without triggering an engine build."""
+    engine = continuous_engine
+    engine.backend.has_model = lambda model_id: False
+
+    (rid,) = add_futures(engine, [(types.RequestType.SAMPLE, "ghost_model", sample_payload(""))])
+    engine.process_pending_requests_once()
+
+    assert _future_status(engine, rid) == RequestStatus.FAILED
+    assert engine.backend.prepare_calls == 0
+    assert engine.backend.sample_calls == []
+
+
 def test_serial_fallback_when_continuous_disabled(continuous_engine):
     """SKYRL_TINKER_CONTINUOUS_SAMPLING=0 semantics: the serial batch path."""
     engine = continuous_engine

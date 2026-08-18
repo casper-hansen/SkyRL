@@ -921,25 +921,32 @@ class TinkerEngine:
     def _admit_samples_continuous(self, sample_requests: dict[str, tuple[str, types.SampleInput]]) -> None:
         """Hand pending sample requests to the background sampler.
 
-        Engines are brought up / woken on this (main) thread first so the
-        sampler's coroutines never touch engine lifecycle. If that fails
-        (e.g. engine build error), the candidate futures are failed with the
-        same semantics as a serial batch failure.
+        Invalid model_ids are failed up front (same semantics as the serial
+        path's _filter_valid_requests — e.g. stale requests from a previous
+        server must not trigger an engine build). Engines are brought up /
+        woken on this (main) thread so the sampler's coroutines never touch
+        engine lifecycle. If that fails (e.g. engine build error), the
+        candidate futures are failed like a serial batch failure.
         """
+        error_results, valid_requests = self._filter_valid_requests(sample_requests)
+        if error_results:
+            self._complete_futures(error_results)
+        if not valid_requests:
+            return
         if self._sampler is None:
             self._sampler = _ContinuousSampler(self)
         try:
             self.backend.prepare_for_sampling()
         except Exception as e:  # noqa: BLE001 - match serial batch failure semantics
-            logger.exception(f"prepare_for_sampling failed; failing {len(sample_requests)} sample request(s): {e}")
+            logger.exception(f"prepare_for_sampling failed; failing {len(valid_requests)} sample request(s): {e}")
             self._complete_futures(
-                {rid: types.ErrorResponse(error=str(e), status="failed") for rid in sample_requests}
+                {rid: types.ErrorResponse(error=str(e), status="failed") for rid in valid_requests}
             )
             return
-        for request_id, (model_id, request_data) in sample_requests.items():
+        for request_id, (model_id, request_data) in valid_requests.items():
             self._sampler.submit(request_id, model_id, request_data)
         logger.debug(
-            f"Admitted {len(sample_requests)} sample request(s); {self._sampler.inflight_count()} in flight"
+            f"Admitted {len(valid_requests)} sample request(s); {self._sampler.inflight_count()} in flight"
         )
 
     def process_pending_requests_once(self) -> None:
