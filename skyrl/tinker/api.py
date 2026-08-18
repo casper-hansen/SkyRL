@@ -1,11 +1,11 @@
 import asyncio
+import json
 import os
 import random
 import re
 import shutil
 import signal
 import threading
-import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, AsyncGenerator, ClassVar, Literal
@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import fastapi
 import psutil
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import (
     Base64Bytes,
@@ -21,10 +21,10 @@ from pydantic import (
     Discriminator,
     Field,
     Tag,
+    ValidationError,
     model_validator,
 )
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel, func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -57,6 +57,122 @@ API_SERVER_STARTUP_ARGS = ["-m", "skyrl.tinker.api"]
 
 # Timeout for graceful shutdown when engine crashes
 SHUTDOWN_TIMEOUT_SECONDS = 10
+
+# How long retrieve_future waits for a result before returning 408
+RETRIEVE_FUTURE_TIMEOUT_SECONDS = 300
+
+# How often poll_futures looks for newly finished requests. A single query
+# covers every waiter, so this can stay tight without the load scaling up with
+# the number of in-flight requests.
+FUTURE_POLL_INTERVAL_SECONDS = 0.05
+
+# Statuses a request never moves out of, i.e. the ones a waiter resolves on.
+TERMINAL_STATUSES = (RequestStatus.COMPLETED, RequestStatus.FAILED)
+
+
+def raw_json_response(payload: str | None) -> Response:
+    """Return already-serialized JSON without routing it through FastAPI's encoder.
+
+    Returning a dict makes FastAPI walk the whole structure with
+    ``jsonable_encoder`` and then ``json.dumps`` it again. For a multi-MB
+    numeric payload that is ~300ms of event-loop time per request, which
+    serializes every other caller behind it. The stored text is already valid
+    JSON, so hand it back as-is.
+    """
+    # `null` keeps the response valid JSON when a completed future stored no
+    # result body, matching what encoding `None` would have produced.
+    return Response(content=payload if payload is not None else "null", media_type="application/json")
+
+
+async def wait_for_future(
+    waiters: dict[int, set[asyncio.Future]], request_id: int, timeout: float
+) -> tuple[RequestStatus, str | None, "types.RequestType"] | None:
+    """Wait for ``request_id`` to finish, returning ``(status, result_data, request_type)``.
+
+    ``result_data`` is the JSON text stored for the request, not a decoded
+    object -- see :class:`FutureDB`. ``request_type`` rides along so
+    ``retrieve_future`` can pick the proto encoder for SDK >= 0.25 clients
+    without a second lookup.
+
+    Returns None if ``timeout`` elapses first, and raises KeyError if the request
+    does not exist -- :func:`poll_futures` reports both.
+
+    Each caller gets its own future rather than sharing one per id, so that a
+    caller giving up removes only its own entry. That matters because concurrent
+    waiters on one id are routine: the SDK times out a retrieve_future call after
+    45s and retries the same request_id, while this endpoint holds the request for
+    up to 300s, so anything slower than 45s accumulates overlapping waiters. It
+    also keeps an abandoned request from pinning an entry in ``waiters`` forever,
+    which would grow the poll query without bound.
+    """
+    waiter = asyncio.get_running_loop().create_future()
+    waiters.setdefault(request_id, set()).add(waiter)
+    try:
+        return await asyncio.wait_for(waiter, timeout)
+    except asyncio.TimeoutError:
+        return None
+    finally:
+        remaining = waiters.get(request_id)
+        if remaining is not None:
+            remaining.discard(waiter)
+            if not remaining:
+                del waiters[request_id]
+
+
+async def poll_futures(
+    db_engine, waiters: dict[int, set[asyncio.Future]], poll_interval_sec: float = FUTURE_POLL_INTERVAL_SECONDS
+) -> None:
+    """Resolve the requests awaited in ``waiters`` as they finish, until cancelled.
+
+    Also reports ids that do not exist. Rows are created before their request_id
+    reaches the client and are never deleted, so an awaited id this query does not
+    return never existed, and its waiters get a KeyError. Detecting that here
+    rather than from a dedicated lookup in the endpoint makes it free: it rides
+    the query already in flight instead of costing a connection checkout on every
+    call, which at a few thousand simultaneous calls is a burst the pool feels.
+
+    ``result_data`` is stored as JSON text and handed to the waiters that way:
+    results may carry big numeric payloads (e.g. top-k prompt logprobs for every
+    prompt token, a few MB per request), and decoding them into Python objects
+    only to have FastAPI re-encode them would cost hundreds of milliseconds of
+    event-loop time per call. See :func:`raw_json_response`.
+    """
+    while True:
+        try:
+            if waiters:
+                awaited = list(waiters)
+                async with AsyncSession(db_engine) as session:
+                    # The awaited ids go in as bound parameters, capped at 32766
+                    # by SQLite (since 3.32) and 65535 by Postgres -- far above
+                    # any plausible number of in-flight requests.
+                    statement = select(
+                        FutureDB.request_id, FutureDB.status, FutureDB.result_data, FutureDB.request_type
+                    ).where(FutureDB.request_id.in_(awaited))
+                    rows = (await session.exec(statement)).all()
+
+                # Pending requests are left alone to be picked up on a later tick.
+                outcomes: dict[int, tuple[RequestStatus, str | None, types.RequestType] | KeyError] = {
+                    request_id: (status, result_data, request_type)
+                    for request_id, status, result_data, request_type in rows
+                    if status in TERMINAL_STATUSES
+                }
+                for request_id in set(awaited) - {request_id for request_id, *_ in rows}:
+                    outcomes[request_id] = KeyError(request_id)
+
+                for request_id, outcome in outcomes.items():
+                    for waiter in waiters.pop(request_id, ()):
+                        if waiter.done():
+                            continue
+                        if isinstance(outcome, BaseException):
+                            waiter.set_exception(outcome)
+                        else:
+                            waiter.set_result(outcome)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Keep the poller alive; waiters fall back on their own timeouts.
+            logger.exception("Future poller iteration failed")
+        await asyncio.sleep(poll_interval_sec)
 
 
 def _get_parent_uv_run_args(parent_cmd: list[str]) -> list[str]:
@@ -115,6 +231,9 @@ async def lifespan(app: FastAPI):
 
     async with app.state.db_engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
+
+    app.state.future_waiters = {}
+    app.state.future_poller = asyncio.create_task(poll_futures(app.state.db_engine, app.state.future_waiters))
 
     # Setup external inference client if configured.
     #
@@ -189,6 +308,10 @@ async def lifespan(app: FastAPI):
     shutting_down = True
     monitor_task.cancel()
 
+    app.state.future_poller.cancel()
+    with suppress(asyncio.CancelledError):
+        await app.state.future_poller
+
     # Close the forwarding client's persistent httpx connection pool if we
     # installed one. Cheap no-op when external_inference_client doesn't own
     # an httpx client (ExternalInferenceClient creates one per call).
@@ -234,16 +357,46 @@ async def create_future(
     request_type: types.RequestType,
     model_id: str | None,
     request_data: BaseModel,
+    seq_id: int | None = None,
 ) -> int:
-    """Create a FutureDB entry and return its auto-generated request_id."""
+    """Create a future, returning the original request_id when an SDK request is retried."""
+    serialized_request = request_data.model_dump(mode="json")
+
+    async def existing_request_id() -> int | None:
+        """The request_id already recorded for this (model_id, seq_id), if there is one."""
+        if model_id is None or seq_id is None:
+            return None
+        statement = select(FutureDB).where(FutureDB.model_id == model_id, FutureDB.seq_id == seq_id)
+        existing = (await session.exec(statement)).first()
+        if existing is None:
+            return None
+        if existing.request_type != request_type or existing.request_data != serialized_request:
+            raise HTTPException(status_code=409, detail="Training request sequence number was reused")
+        return existing.request_id
+
+    if (request_id := await existing_request_id()) is not None:
+        return request_id
+
     future_db = FutureDB(
         request_type=request_type,
         model_id=model_id,
-        request_data=request_data.model_dump(mode="json"),
+        seq_id=seq_id,
+        request_data=serialized_request,
         status=RequestStatus.PENDING,
     )
-    session.add(future_db)
-    await session.flush()  # Flush to generate auto-increment request_id
+    try:
+        # Savepoint rather than a plain flush: losing the insert race must roll back
+        # only this row. Callers stage other writes before getting here (save_weights
+        # adds a pending checkpoint), and a session-wide rollback would discard them.
+        async with session.begin_nested():
+            session.add(future_db)
+            await session.flush()  # Flush to generate auto-increment request_id
+    except IntegrityError:
+        # A concurrent retry inserted the same (model_id, seq_id) first; return its future.
+        request_id = await existing_request_id()
+        if request_id is None:
+            raise
+        return request_id
     assert future_db.request_id
     return future_db.request_id
 
@@ -452,13 +605,14 @@ class ForwardBackwardInput(BaseModel):
         "cross_entropy": set(),
         "importance_sampling": set(),
         "ppo": {"clip_low_threshold", "clip_high_threshold", "value_clip"},
+        "gspo": {"clip_low_threshold", "clip_high_threshold"},
         "cispo": {"clip_low_threshold", "clip_high_threshold"},
         "ppo_critic": {"value_clip"},
         "dppo": {"delta_low", "delta_high"},
     }
 
     data: list[Datum]
-    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "cispo", "ppo_critic", "dppo"]
+    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "gspo", "cispo", "ppo_critic", "dppo"]
     loss_fn_config: dict[str, float] | None = None
 
     @model_validator(mode="after")
@@ -491,11 +645,13 @@ class ForwardBackwardInput(BaseModel):
 class ForwardBackwardRequest(BaseModel):
     model_id: str
     forward_backward_input: ForwardBackwardInput
+    seq_id: int | None = None
 
 
 class ForwardRequest(BaseModel):
     model_id: str
     forward_input: ForwardBackwardInput
+    seq_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +913,7 @@ class AdamParams(BaseModel):
 class OptimStepRequest(BaseModel):
     model_id: str
     adam_params: AdamParams
+    seq_id: int | None = None
 
 
 class SaveWeightsForSamplerRequest(BaseModel):
@@ -1181,6 +1338,7 @@ async def forward_backward(raw_request: Request, session: AsyncSession = Depends
         request_type=types.RequestType.FORWARD if forward_only else types.RequestType.FORWARD_BACKWARD,
         model_id=request.model_id,
         request_data=request.forward_backward_input.to_types(),
+        seq_id=request.seq_id,
     )
 
     await session.commit()
@@ -1198,6 +1356,7 @@ async def forward(request: ForwardRequest, session: AsyncSession = Depends(get_s
         request_type=types.RequestType.FORWARD,
         model_id=request.model_id,
         request_data=request.forward_input.to_types(),
+        seq_id=request.seq_id,
     )
 
     await session.commit()
@@ -1215,6 +1374,7 @@ async def optim_step(request: OptimStepRequest, session: AsyncSession = Depends(
         request_type=types.RequestType.OPTIM_STEP,
         model_id=request.model_id,
         request_data=types.OptimStepInput(adam_params=request.adam_params.to_types()),
+        seq_id=request.seq_id,
     )
 
     await session.commit()
@@ -1411,62 +1571,38 @@ class RetrieveFutureRequest(BaseModel):
 @app.post("/api/v1/retrieve_future")
 async def retrieve_future(request: RetrieveFutureRequest, req: Request):
     """Retrieve the result of an async operation, waiting until it's available."""
-    timeout = 300  # 5 minutes
-    deadline = time.perf_counter() + timeout
+    request_id = int(request.request_id)
 
-    # Start with 100ms, grow to 1s
-    poll = 0.1
-    max_poll = 1.0
+    try:
+        row = await wait_for_future(req.app.state.future_waiters, request_id, RETRIEVE_FUTURE_TIMEOUT_SECONDS)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Future not found")
 
-    while time.perf_counter() < deadline:
-        try:
-            async with AsyncSession(req.app.state.db_engine) as session:
-                # First, only query the status to avoid deserializing JSON data
-                statement = select(FutureDB.status).where(FutureDB.request_id == int(request.request_id))
-                result = await session.exec(statement)
-                status = result.first()
+    if row is None:
+        raise HTTPException(status_code=408, detail="Timeout waiting for result")
 
-                if not status:
-                    raise HTTPException(status_code=404, detail="Future not found")
+    status, result_data, request_type = row
+    if status == RequestStatus.COMPLETED:
+        # SDK >= 0.25 only accepts forward_backward/sample results as proto
+        # (it sends Accept: application/x-protobuf and raises on a JSON body
+        # for those types). Encode on demand; the stored JSON text is decoded
+        # only when a proto client asks, so plain-JSON callers keep the
+        # zero-copy raw_json_response path.
+        encoder = _PROTO_RESULT_ENCODERS.get(request_type)
+        if encoder is not None and result_data is not None and _PROTO_CONTENT_TYPE in req.headers.get("accept", ""):
+            result = json.loads(result_data)
+            if "error" not in result:
+                return fastapi.Response(content=encoder(result), media_type=_PROTO_CONTENT_TYPE)
+        return raw_json_response(result_data)
 
-                # Only fetch full record if status is terminal (completed or failed)
-                if status in (RequestStatus.COMPLETED, RequestStatus.FAILED):
-                    statement = select(FutureDB).where(FutureDB.request_id == int(request.request_id))
-                    result = await session.exec(statement)
-                    future = result.first()
-
-                    if future.status == RequestStatus.COMPLETED:
-                        # SDK >= 0.25 only accepts forward_backward/sample results as
-                        # proto (it sends Accept: application/x-protobuf and raises on
-                        # a JSON body for those types). Encode on demand; fall back to
-                        # JSON for clients that don't ask.
-                        encoder = _PROTO_RESULT_ENCODERS.get(future.request_type)
-                        if (
-                            encoder is not None
-                            and future.result_data is not None
-                            and "error" not in future.result_data
-                            and _PROTO_CONTENT_TYPE in req.headers.get("accept", "")
-                        ):
-                            return fastapi.Response(
-                                content=encoder(future.result_data),
-                                media_type=_PROTO_CONTENT_TYPE,
-                            )
-                        return future.result_data
-
-                    if future.status == RequestStatus.FAILED:
-                        # Return 400 for handled errors (validation, etc.), 500 for unexpected failures
-                        if future.result_data and "error" in future.result_data:
-                            raise HTTPException(status_code=400, detail=future.result_data["error"])
-                        else:
-                            raise HTTPException(status_code=500, detail="Unknown error")
-        except SATimeoutError:
-            pass
-
-        # Exponential backoff
-        await asyncio.sleep(poll)
-        poll = min(poll * 1.5, max_poll)
-
-    raise HTTPException(status_code=408, detail="Timeout waiting for result")
+    # Return 400 for handled errors (validation, etc.), 500 for unexpected failures.
+    # Every writer of a FAILED row stores a types.ErrorResponse, so decode it as
+    # one; anything else is not an error we can report, and falls through to 500.
+    try:
+        error = types.ErrorResponse.model_validate_json(result_data)
+    except ValidationError:
+        raise HTTPException(status_code=500, detail="Unknown error")
+    raise HTTPException(status_code=400, detail=error.error)
 
 
 @app.post("/api/v1/telemetry", response_model=TelemetryResponse)
