@@ -1446,8 +1446,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
 
         Returns ``(lora_name, lora_sync_path)`` so the caller (the dispatch in
         the engine process) can issue the engine load itself once the engines
-        are awake. The frozen masters must be GPU-resident: the bridge's
-        collective export hangs when it runs against offloaded params.
+        are awake. The export reads only the LoRA adapter tensors, which stay
+        GPU-resident through offload (LoRA DDP buffers are exempt — see
+        offload_megatron_model_to_cpu), so the TB-scale frozen masters may
+        remain offloaded while this runs. The bridge's collectives do hang if
+        the *adapters* themselves are ever offloaded; the exemption is what
+        prevents that.
         """
         lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
         await self._save_lora_adapters_and_sync(

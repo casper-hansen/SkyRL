@@ -662,13 +662,19 @@ class WorkerDispatch:
 
         vLLM serves the released base checkpoint and hot-loads the LoRA
         adapter, so the only bytes that must reach the engines are the adapter
-        tensors (a few GB) — never the TB-scale frozen masters. Sequence:
+        tensors (a few GB) — never the TB-scale frozen masters. The bridge
+        export streams straight from the LoRA DDP buffers, which stay
+        GPU-resident through offload (see offload_megatron_model_to_cpu), so
+        the sync never backloads the masters: a cold (fully offloaded)
+        trainer syncs in seconds instead of re-faulting TBs of mmap'd frozen
+        weights through a page cache the engine build just evicted — that
+        re-fault stalled run-start syncs for 15+ minutes and starved client
+        deadlines. Sequence:
 
-        1. export + write the adapter (bridge collective; masters must be
-           GPU-resident for it, which they already are on every post-optim
-           sync; the first sync backloads them once from the existing pinned
-           buffers),
-        2. offload the masters/optimizer so the engines fit on the GPUs,
+        1. export + write the adapter (collective over the GPU-resident
+           adapter tensors only; frozen masters stay offloaded),
+        2. if a preceding phase (forward/optim) left masters or optimizer
+           resident, offload them so the engines fit on the GPUs,
         3. wake the engines if they were asleep,
         4. point the engines at the new adapter files (prefix cache reset +
            load request), issued from this process so the engines are awake
@@ -677,25 +683,19 @@ class WorkerDispatch:
         self.ensure_active_adapter("policy", model_id)
         state = self._gpu_state["policy"]
 
-        if not state.model_on_gpu:
-            if not engines_asleep:
-                # Masters must be resident for the export, and engines must
-                # release the GPUs before the masters can backload.
-                await self._inference_engine_client.sleep(level=1)
-                engines_asleep = True
-            self._ensure_on_gpu("policy", need_optimizer=False, need_model=True)
-
         # 1. Collective adapter export + per-node write (no engine calls).
         results = ray.get(
             self._actor_groups["policy"].async_run_ray_method("pass_through", "save_lora_adapters", model_id=model_id)
         )
         lora_name, lora_sync_path = results[0]
 
-        # 2. Free the masters/optimizer (copies into their existing pinned
-        # buffers; the adapters themselves stay GPU-resident — LoRA DDP
-        # buffers are exempt from offload, see offload_megatron_model_to_cpu).
-        self._offload("policy", offload_optimizer=True, offload_model=True)
-        self.empty_cache("policy")
+        # 2. Free the masters/optimizer if a preceding forward/optim phase
+        # left them resident (copies into their existing pinned buffers; the
+        # adapters themselves stay GPU-resident — LoRA DDP buffers are exempt
+        # from offload). A cold sync has nothing resident and skips this.
+        if state.model_on_gpu or state.optimizer_on_gpu:
+            self._offload("policy", offload_optimizer=True, offload_model=True)
+            self.empty_cache("policy")
 
         # 3. Wake the engines (weights + KV) if needed.
         if engines_asleep:
