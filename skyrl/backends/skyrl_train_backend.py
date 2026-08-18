@@ -357,6 +357,19 @@ class SkyRLTrainBackend(AbstractBackend):
         except Exception as e:
             logger.warning(f"Inference-state publisher failed (proxy_url={proxy_url!r}): {e}")
 
+    @property
+    def _adapter_only_sync(self) -> bool:
+        """True when sampler syncs ship standalone LoRA adapters to vLLM
+        (megatron + lora.rank>0 + merge_lora=False) instead of broadcasting
+        full weights — the path that never backloads the frozen masters."""
+        lora_cfg = self._cfg.trainer.policy.model.lora
+        return (
+            self._cfg.trainer.strategy == "megatron"
+            and lora_cfg is not None
+            and lora_cfg.rank > 0
+            and not self._cfg.trainer.policy.megatron_config.lora_config.merge_lora
+        )
+
     def _create_new_inference_client(self):
         """Create new HTTP-based inference client."""
         from skyrl.backends.skyrl_train.inference_servers.setup import (
@@ -383,7 +396,17 @@ class SkyRLTrainBackend(AbstractBackend):
         # woken before sampling. sleep() is async with no running loop here, hence
         # asyncio.run. Defaulting to level 2 (the client clamps to level 1 when
         # LoRA weight sync is in use, since level 2 would discard the base model).
-        if is_colocated:
+        #
+        # Adapter-only LoRA sync is the exception: engines are created lazily by
+        # the first save_weights_for_sampler, which exports the adapter from the
+        # always-GPU-resident LoRA buffers and loads it onto *awake* engines —
+        # no trainer backload happens, so nothing needs the GPUs freed. Sleeping
+        # here would back up ~TBs of engine weights to CPU (evicting the frozen-
+        # offload page cache, minutes per node) only for the sync to wake them
+        # right back up. Training paths (forward/optim/checkpoint) sleep the
+        # engines on demand via _sleep_inference_engines(), so skipping the
+        # eager sleep keeps the colocation contract.
+        if is_colocated and not self._adapter_only_sync:
             asyncio.run(client.sleep())
             self._engines_asleep = True
 
@@ -1358,13 +1381,7 @@ class SkyRLTrainBackend(AbstractBackend):
         # Lazily create inference engines on first sampling-related call
         self._ensure_inference_engines()
 
-        lora_cfg = self._cfg.trainer.policy.model.lora
-        adapter_only_sync = (
-            self._cfg.trainer.strategy == "megatron"
-            and lora_cfg
-            and lora_cfg.rank > 0
-            and not self._cfg.trainer.policy.megatron_config.lora_config.merge_lora
-        )
+        adapter_only_sync = self._adapter_only_sync
         if not adapter_only_sync:
             # The classic colocated sync dance (wake weights -> broadcast ->
             # wake KV cache) assumes engines start asleep; a preceding sample
