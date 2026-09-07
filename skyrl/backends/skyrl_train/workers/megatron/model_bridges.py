@@ -18,8 +18,17 @@ try:
     )
     from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
     from megatron.bridge.models.conversion.param_mapping import AutoMapping
-    from megatron.bridge.models.conversion.utils import moe_experts_stored_packed
     from megatron.bridge.models.deepseek.common import get_common_mapping_list
+
+    try:
+        from megatron.bridge.models.conversion.utils import moe_experts_stored_packed
+    except ImportError:
+        # megatron-bridge < 0.7.0: the fused expert layout is hardcoded and
+        # _get_moe_lm_mappings has no experts_packed argument (see
+        # Qwen35MoELMBridge.mapping_registry). Only that bridge needs the
+        # helper; every other registration below must not be lost to a
+        # module-level ImportError on the older stack.
+        moe_experts_stored_packed = None
     from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
     from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
     from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge
@@ -144,6 +153,11 @@ try:
             # 0.7.0 made it the `experts_packed` argument, defaulting to False,
             # which silently produces mappings that match nothing on a fused
             # checkpoint (the expert weights then keep their initialized values).
+            if moe_experts_stored_packed is None:
+                # megatron-bridge < 0.7.0 hardcodes the fused layout.
+                return MegatronMappingRegistry(
+                    *self._get_moe_lm_mappings(hf_prefix="model.language_model.", megatron_prefix="")
+                )
             experts_packed = moe_experts_stored_packed(
                 getattr(self, "hf_pretrained", None), "model.language_model.layers."
             )
@@ -313,12 +327,12 @@ except ImportError as _bridge_import_error:
 
     if _importlib_util.find_spec("megatron") is not None and _importlib_util.find_spec("megatron.bridge") is not None:
         # megatron-bridge IS installed, so this is version skew on one of the
-        # imports above (e.g. moe_experts_stored_packed needs >= 0.7.0), not a
-        # CPU-only environment. Every SkyRL bridge registration above was
-        # skipped, which makes AutoBridge fall back to megatron-bridge's own
-        # bridges -- for Kimi K2.5-family checkpoints that is the VL bridge,
-        # not the text-only GPTModel one the recipe trains with. Say so
-        # loudly instead of failing later in weight conversion.
+        # imports above, not a CPU-only environment. Every SkyRL bridge
+        # registration above was skipped, which makes AutoBridge fall back to
+        # megatron-bridge's own bridges -- for Kimi K2.5-family checkpoints
+        # that is the VL bridge, not the text-only GPTModel one the recipe
+        # trains with. Say so loudly instead of failing later in weight
+        # conversion.
         logger.warning(
             "skyrl model bridges NOT registered: megatron-bridge is installed but an import failed "
             f"({_bridge_import_error}); the installed megatron-bridge is likely older than the pinned one."
