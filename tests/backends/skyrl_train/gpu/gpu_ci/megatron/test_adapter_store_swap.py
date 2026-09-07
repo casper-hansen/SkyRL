@@ -73,8 +73,11 @@ def test_swap_with_offloaded_grads_does_not_crash(store_env):
     store.create("B", [buf], opt, _SIG)  # seeded from pristine
     pristine_params = buf.param_data.clone()
 
-    # "Train" A, then offload grads exactly like offload_after_step does.
+    # "Train" A, then offload grads exactly like offload_after_step does:
+    # the worker parks the live adapter's grads into its slot right before
+    # the offload frees the buffers (MegatronPolicyWorkerBase.offload_to_cpu).
     buf.param_data.add_(1.0)
+    store.park_grads([buf])
     buf.free_grad_storage()
 
     # Previously: torch.AcceleratorError CUDA invalid argument in _restore.
@@ -87,7 +90,7 @@ def test_swap_with_offloaded_grads_does_not_crash(store_env):
     # A's slot still captured the trained params (param storage was live) ...
     a_params = store._slots["A"].cpu_param_data[0][0]
     assert torch.equal(a_params, (pristine_params + 1.0).cpu())
-    # ... while its grads were recorded as zero instead of reading freed memory.
+    # ... and its grads are the parked (zero) grads, not a read of freed memory.
     a_grads = store._slots["A"].cpu_grad_data[0][0]
     assert torch.count_nonzero(a_grads) == 0
 
@@ -122,6 +125,7 @@ def test_full_prod_sequence_create_before_expiry_delete(store_env):
     buf.param_data.add_(3.0)  # overnight training
     store.create("B", [buf], opt, _SIG)  # new session registers first...
     store.delete("A")  # ...then the stale session expires
+    store.park_grads([buf])  # no current adapter: nothing to park
     buf.free_grad_storage()  # trainer idle: grads offloaded
 
     store.swap_to("B", [buf], opt)

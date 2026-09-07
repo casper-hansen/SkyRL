@@ -204,6 +204,43 @@ class TestSaveWeights:
         dispatch._inference_engine_client.resume_generation.assert_awaited_once()
 
 
+@pytest.mark.parametrize("offload_after_step", [False, True])
+def test_weight_sync_honors_optimizer_offload_policy(offload_after_step):
+    from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+
+    cfg = _fft_dispatch_cfg()
+    cfg.trainer.policy.optimizer_config = SimpleNamespace(offload_after_step=offload_after_step)
+
+    dispatch = WorkerDispatch.__new__(WorkerDispatch)
+    dispatch.colocate_all = True
+    dispatch.cfg = cfg
+    dispatch._gpu_state = {
+        "policy": SimpleNamespace(optimizer_on_gpu=True),
+    }
+    dispatch._ensure_on_gpu = MagicMock()
+    dispatch._offload = MagicMock()
+    # _prepare_for_weight_sync releases cached allocator blocks before the
+    # engines wake; that goes through the actor group, which this bare
+    # dispatch has none of.
+    dispatch.empty_cache = MagicMock()
+
+    dispatch._prepare_for_weight_sync()
+
+    dispatch._ensure_on_gpu.assert_called_once_with(
+        "policy",
+        need_optimizer=False,
+        need_model=True,
+    )
+    if offload_after_step:
+        dispatch._offload.assert_called_once_with("policy", offload_optimizer=True, offload_model=False)
+    else:
+        dispatch._offload.assert_not_called()
+
+    dispatch._offload.reset_mock()
+    dispatch._finish_weight_sync()
+    dispatch._offload.assert_called_once_with("policy", offload_optimizer=offload_after_step, offload_model=True)
+
+
 def _adapter_sync_dispatch(*, model_on_gpu: bool, optimizer_on_gpu: bool = False):
     """Dispatch wired for the colocated adapter-only sync path
     (megatron + lora.rank>0 + merge_lora=False + colocate_all)."""
@@ -255,6 +292,9 @@ class TestAdapterOnlyColocatedSync:
 
         dispatch._inference_engine_client.sleep.assert_not_awaited()
         dispatch._ensure_on_gpu.assert_not_called()
+        # The swap must opt out of ensure_active_adapter's residency backload:
+        # the LoRA buffers it copies are GPU-resident regardless.
+        dispatch.ensure_active_adapter.assert_called_once_with("policy", "m1", backload_model=False)
         dispatch._offload.assert_not_called()
         dispatch._inference_engine_client.wake_up.assert_not_awaited()
         dispatch._load_lora_on_engines.assert_awaited_once_with("adapter-m1", "/tmp/lora/m1")

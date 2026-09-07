@@ -1,6 +1,22 @@
 # CUDA-13 install (Blackwell-Ultra: sm103, e.g. B300/GB300)
 
-The root project targets CUDA 12.8 images. Blackwell-Ultra GPUs need the
+> **Status after merging upstream main (2026-09):** the root project is now
+> CUDA-13 natively (torch 2.11 cu130, vLLM 0.28.0, transformer-engine 2.16,
+> flashinfer 0.6.16.post3, megatron-bridge 0.7.0, megatron-core 0.20,
+> transformers <= 5.16.1, ray 2.57), so the premise below no longer holds and
+> the pins in this directory (vLLM 0.26.0, megatron-bridge 0.6.0, TE 2.11,
+> flashinfer 0.6.13) are *older* than the root lock. The merged code already
+> assumes the newer stack: `workers/megatron/model_bridges.py` imports
+> `moe_experts_stored_packed` (megatron-bridge >= 0.7.0); on a 0.6.0 venv the
+> import fails, every SkyRL bridge registration is skipped (a warning is
+> logged), and Kimi K2.5-family checkpoints dispatch to megatron-bridge's VL
+> bridge instead of the text-only one. Regenerate this manifest from the
+> root lock (`regenerate.sh` now works directly on main's CUDA-13 lock; update
+> `overrides.txt`/`install.sh` pins to match) and re-verify on B300 before
+> deploying the merged branch. The text below describes the previously
+> verified 0.26 stack.
+
+The root project used to target CUDA 12.8 images. Blackwell-Ultra GPUs need the
 CUDA-13 stack instead: PyPI torch 2.11 (the cu130 build), the PyPI vllm 0.26.0
 wheel (its default build is CUDA 13.0; sm_100 cubins are family-compatible
 with sm103), flashinfer's cu130 jit-cache (the only build with sm103 kernels),
